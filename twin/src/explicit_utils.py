@@ -14,12 +14,14 @@ NumpyInt16Array = npt.NDArray[np.int16]
 NumpyInt32Array = npt.NDArray[np.int32]
 
 # *************************************************************************************************
+# rfb-minecraft data directories
+rfb_minecraft_dir: Path = Path('/Users/yuesun/code/rfb/rfb-minecraft/refsims')
 # Path to the flow simulations
-top_dir_flow: Path = Path('npy/01_flow')
+top_dir_flow: Path = rfb_minecraft_dir / 'npy/01_flow'
 # Path to the mass transport utilization simulations
-top_dir_mtu: Path = Path('npy/02_mass_transport')
+top_dir_mtu: Path = rfb_minecraft_dir / 'npy/02_mass_transport'
 # Path to the explicit Nernst simulation (simplified Butler-Volmer model)
-top_dir_exp: Path = Path('npy/03_nernst')
+top_dir_exp: Path = rfb_minecraft_dir / 'npy/03_nernst'
 
 # *************************************************************************************************
 # Physical constants

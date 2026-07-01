@@ -34,6 +34,8 @@ diff: float = 4.0E-6    # The diffusivity of AQDS in cm^2 / sec
 # *************************************************************************************************
 def calc_dir_npy(sim_type: SimType, pressure: int, stage:int) -> Path:
     """The directory with numpy simulation data for a given pressure and stage"""
+    # The rfb-minecraft data directory
+    dir0: Path = '/Users/yuesun/code/rfb/rfb-minecraft/refsims'
     # The top level directory
     dir1: str = 'npy'
     # The second level directory
@@ -46,7 +48,7 @@ def calc_dir_npy(sim_type: SimType, pressure: int, stage:int) -> Path:
     # The stage
     dir4: str = f'stage{stage:02d}'
     # The full path
-    return Path(f'{dir1}/{dir2}/{dir3}/{dir4}')
+    return Path(f'{dir0}/{dir1}/{dir2}/{dir3}/{dir4}')
 
 # *************************************************************************************************
 def load_flow_sim(pressure: int, stage: int, level: int) -> FlowSim:
