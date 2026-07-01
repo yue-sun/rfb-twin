@@ -96,3 +96,6 @@ scratch
 **/Thumbs.db
 **/Thumbs.db:encryptable
 
+# MacOS
+**/.DS_Store
+.DS_Store?
