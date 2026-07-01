@@ -417,8 +417,17 @@ def adjust_op_wire(A: csr_array, geom: Geometry) -> csr_array:
     # The corresponding volumes of these cells
     vol_r: NumpyFloatArray = volume[rr]
     vol_s: NumpyFloatArray = volume[ss]
+    # Guard against divide-by-zero in wire cell volume.
+    eps: float = np.finfo(np.float64).tiny
+    mask_vol_ok: NumpyBoolArray = np.abs(vol_s) > eps
+    n_zero_vol: int = int(np.size(vol_s) - np.count_nonzero(mask_vol_ok))
+    if n_zero_vol > 0:
+        print(f'Warning: adjust_op_wire() skipped {n_zero_vol} entries with near-zero wire volume.')
+
+    ratio: NumpyFloatArray = np.zeros_like(vol_r)
+    np.divide(vol_r, vol_s, out=ratio, where=mask_vol_ok)
     # The new entries on the diagonal
-    val_diag: NumpyFloatArray = -val_old * (vol_r / vol_s)
+    val_diag: NumpyFloatArray = -val_old * ratio
     # The new entries off the diagonal
     val_off: NumpyFloatArray = -val_diag
     
