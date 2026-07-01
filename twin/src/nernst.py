@@ -77,6 +77,8 @@ class SolverOpt:
     dir_out: Path
     # Initial guess for SOC; defaults to 0
     s0: Optional[NumpyFloatArray] = None
+    # Uniform SOC initialization in fluid cells when s0 is not provided
+    soc_init: float = 0.5
     # Initial guess for dimensionless overpotential; defaults to 0
     eta0: Optional[NumpyFloatArray] = None
     # Whether to load the last available step
@@ -111,6 +113,7 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
     save_int: int = solv_opt.save_int
     dir_out: Path = solv_opt.dir_out
     s0_in: Optional[NumpyFloatArray] = solv_opt.s0
+    soc_init: float = solv_opt.soc_init
     eta0_in: Optional[NumpyFloatArray] = solv_opt.eta0
     restart: bool = solv_opt.restart
     step: int = solv_opt.restart_step
@@ -181,8 +184,8 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
         eta0_in = eta0_load if eta0_in is None else eta0_in
         print(f'Loading data from step {step:d}.')
 
-    # SOC on even steps
-    s0: NumpyFloatArray = np.zeros(N, dtype=np.float64) if s0_in is None else s0_in.flatten().copy()
+    # SOC on even steps; default to a uniform fluid background when no initial state is provided.
+    s0: NumpyFloatArray = np.full(N, soc_init, dtype=np.float64) if s0_in is None else s0_in.flatten().copy()
     # Dimensionless overpotential on wire cells at even time steps; eta = eta_mV / (ne V_T)
     eta0: NumpyFloatArray = np.zeros(n_wire, dtype=np.float64) if eta0_in is None else eta0_in.flatten().copy()
     # Impose SOC boundary conditions
@@ -242,6 +245,16 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
     I_max_A: float = Q_Lps * c0 * ne * F    # Maximum current in Amperes at 100% utilization
     I_max_mA: float = I_max_A * 1.0E3       # Maximum current in milliamperes at 100% utilization
 
+    # Summary diagnostics (initialized to current state for robustness in short/zero-iteration runs)
+    eta_mean: float = float(np.mean(get_last_eta(step)))
+    op_mean: float = eta_mean * V_T / ne
+    s_wire: float = float(np.mean(get_last_soc(step)[is_wire]))
+    s_fluid: float = float(np.mean(get_last_soc(step)[is_fluid]))
+    s_out: float = float(np.mean(get_last_soc(step)[is_outlet]))
+    util_wire: float = 0.0
+    util_out: float = float(np.sum(get_last_soc(step)[is_outlet] * u_out) / u_out_sum) if u_out_sum != 0.0 else 0.0
+    current: float = I_max_mA * util_wire
+
     # Open text file to write convergence data
     path_conv: Path = dir_out / 'convergence.csv'
     with open(path_conv, 'a') as fh:
@@ -258,8 +271,9 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
 
         # Start timer
         t0: float = float(time.time())
-        # Step counter; step i advances from s[i-1] to s[i]
-        i: int
+        # Step counter; step i advances from s[i-1] to s[i].
+        # Initialize from restart step in case the loop below executes zero iterations.
+        i: int = step
         # Take time steps
         for i in range(step+1, max_step+1):
             if (i % 2) == 1:            
@@ -353,11 +367,14 @@ def main():
     parser.add_argument('-P', '--pressure', type=int, help='Pressure in Pa (int)')
     parser.add_argument('-V', '--voltage', type=int, help='Voltage in mV (int)')
     parser.add_argument('-S', '--stage', type=int, help='Stage of the simulation (int)')
+    parser.add_argument('-L', '--level', type=int, help='Refinement level of the flow simulation (int)')
     parser.add_argument('-C', '--cfl', type=float, default=0.50, help='CFL parameter (float, default 0.5)')
     parser.add_argument('-O', '--omega', type=float, default=1.0E-3, help='Relaxation parameter (float, default 1E-3)')
     parser.add_argument('-T', '--tol', type=float, default=1.0E-4, 
                         help='Convergence tolerance (RMS change in SOC) per flow time (float, default 1E-4)')
-    parser.add_argument('-M', '--max_step', type=int, default=0, help='Maximum number of steps (int, default 0)')
+    parser.add_argument('--soc_init', type=float, default=0.5,
+                        help='Uniform initial SOC in fluid cells when not restarting (float in [0,1], default 0.5)')
+    parser.add_argument('-M', '--max_step', type=int, default=100, help='Maximum number of steps (int, default 0)')
     parser.add_argument('-R', '--restart', action='store_true',
                         help='Whether to restart from last step (bool, default False)')
     parser.add_argument('--restart_step', type=int, default=0, help='Specific step to restart from (int, default 0)')
@@ -367,13 +384,17 @@ def main():
     pressure: int = pa.pressure
     voltage: int = pa.voltage
     stage: int = pa.stage
-    level: int = stage - 1
+    level: int = pa.level
     cfl: float = pa.cfl
     omega: float = pa.omega
     tol: float = pa.tol
+    soc_init: float = pa.soc_init
     max_step_input: int = pa.max_step
     restart: bool = pa.restart
     restart_step: int = pa.restart_step
+
+    if not (0.0 <= soc_init <= 1.0):
+        raise ValueError(f'Expected soc_init in [0,1], got {soc_init:0.6f}.')
 
     # Load the flow simulation
     sim: FlowSim = load_flow_sim(pressure=pressure, stage=stage, level=level)
@@ -409,6 +430,7 @@ def main():
     print(f'CFL             = {cfl:0.3f}')
     print(f'omega           = {omega:0.3e}')
     print(f'tol             = {tol:0.3e}')
+    print(f'soc_init        = {soc_init:0.6f}')
     # Summarize the geometry
     geom.summarize()
 
@@ -444,7 +466,8 @@ def main():
     solv_opt: SolverOpt = SolverOpt(
         pressure=pressure, voltage=voltage, k0=k0, omega=omega,
         tol=tol, tau=tau, dt=dt, max_step=max_step, prog_int=prog_int, 
-        save_int=save_int, dir_out=dir_out, restart=restart, restart_step=restart_step)
+        save_int=save_int, dir_out=dir_out, soc_init=soc_init,
+        restart=restart, restart_step=restart_step)
     
     # Solve for steady state
     soc: NumpyFloatArray 
@@ -554,5 +577,5 @@ def test():
 
 # *************************************************************************************************
 if __name__ == '__main__':
-    # main()
-    test()
+    main()
+    # test()
