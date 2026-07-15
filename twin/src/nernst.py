@@ -17,7 +17,7 @@ import socket
 from typing import Optional
 
 # Local imports
-from utils import Geometry, FlowSim, make_P_str, make_V_str
+from utils import Geometry, FlowSim, make_P_str, make_V_str, load_flow_sim_impl
 from flow_op import calc_dt, make_time_step_op, adjust_op_wire, summarize_op
 from mt_util import load_flow_sim
 
@@ -30,6 +30,16 @@ NumpyInt32Array = npt.NDArray[np.int32]
 # *************************************************************************************************
 # Physical constants
 from constants import R, T, F, V_T, ne, c0, diff, k0
+
+# *************************************************************************************************
+# Default base directory for one simulation. The flow-sim inputs live in
+# <base>/npy (produced by gen_input_npy.py: domain_*.npy, grid_shape.npy and an
+# L{level}/ subdirectory) and the results are written to <base>/python_results.
+# Override the base with -I/--in-dir, or override either subdirectory directly
+# with -D/--flow-dir and --out-dir.
+DIR_BASE: Path = Path('/Users/yuesun/code/rfb/rfb-minecraft/refsims/minecraft_AAAA_1e-2')
+SUBDIR_FLOW: str = 'npy'
+SUBDIR_OUT: str = 'python_results'
 
 # *************************************************************************************************
 def calc_dir_out(pressure: int, voltage: int, stage:int) -> Path:
@@ -364,10 +374,17 @@ def main():
     """Console program"""
     # Parse command line arguments
     parser = argparse.ArgumentParser(description='Solve for the state of charge in the Nernst model.')
-    parser.add_argument('-P', '--pressure', type=int, help='Pressure in Pa (int)')
-    parser.add_argument('-V', '--voltage', type=int, help='Voltage in mV (int)')
-    parser.add_argument('-S', '--stage', type=int, help='Stage of the simulation (int)')
-    parser.add_argument('-L', '--level', type=int, help='Refinement level of the flow simulation (int)')
+    parser.add_argument('-V', '--voltage', type=int, required=True, help='Voltage in mV (int)')
+    parser.add_argument('-L', '--level', type=int, required=True, help='Refinement level of the flow simulation (int)')
+    parser.add_argument('-P', '--pressure', type=int, default=None, help='Pressure in Pa (int, optional label only)')
+    parser.add_argument('-S', '--stage', type=int, default=None, help='Stage of the simulation (int, optional label only)')
+    parser.add_argument('-I', '--in-dir', type=str, default=None,
+                        help=f'Base simulation directory; inputs read from <in-dir>/{SUBDIR_FLOW} '
+                             f'and results written to <in-dir>/{SUBDIR_OUT} (default: {DIR_BASE})')
+    parser.add_argument('-D', '--flow-dir', type=str, default=None,
+                        help=f'Override the flow-sim .npy directory (default: <in-dir>/{SUBDIR_FLOW})')
+    parser.add_argument('--out-dir', type=str, default=None,
+                        help=f'Override the results directory (default: <in-dir>/{SUBDIR_OUT})')
     parser.add_argument('-C', '--cfl', type=float, default=0.50, help='CFL parameter (float, default 0.5)')
     parser.add_argument('-O', '--omega', type=float, default=1.0E-3, help='Relaxation parameter (float, default 1E-3)')
     parser.add_argument('-T', '--tol', type=float, default=1.0E-4, 
@@ -396,8 +413,14 @@ def main():
     if not (0.0 <= soc_init <= 1.0):
         raise ValueError(f'Expected soc_init in [0,1], got {soc_init:0.6f}.')
 
-    # Load the flow simulation
-    sim: FlowSim = load_flow_sim(pressure=pressure, stage=stage, level=level)
+    # Resolve input/output directories from the base dir (-I), with optional
+    # per-directory overrides (-D for inputs, --out-dir for results)
+    base_dir: Path = Path(pa.in_dir) if pa.in_dir else DIR_BASE
+    flow_dir: Path = Path(pa.flow_dir) if pa.flow_dir else base_dir / SUBDIR_FLOW
+    dir_out: Path = Path(pa.out_dir) if pa.out_dir else base_dir / SUBDIR_OUT
+
+    # Load the flow simulation from the resolved .npy directory
+    sim: FlowSim = load_flow_sim_impl(dir_npy=flow_dir, level=level)
 
     # Unpack velocity array
     velocity: NumpyFloatArray = sim.velocity
@@ -420,9 +443,13 @@ def main():
     print(f'Hostname  : {hostname:s}.')
     print(f'Start Time: {start_time:s}')
     print('\nCommand Line Inputs:')
-    print(f'pressure        = {pressure:d} Pa')
+    print(f'flow_dir        = {flow_dir}')
+    print(f'out_dir         = {dir_out}')
+    if pressure is not None:
+        print(f'pressure        = {pressure:d} Pa')
     print(f'voltage         = {voltage:d} mV')
-    print(f'stage           = {stage:d}')
+    if stage is not None:
+        print(f'stage           = {stage:d}')
     print(f'level           = {level:d}')
     print(f'max_step        = {max_step_input:6d}')
     print(f'restart         = {restart}')
@@ -445,8 +472,7 @@ def main():
     F: csr_array = T - I
     summarize_op(F, geom, 'Flow operator with wire entries')
 
-    # Additional options for the steady state solver
-    dir_out: Path = calc_dir_out(pressure=pressure, voltage=voltage, stage=stage)
+    # Additional options for the steady state solver (dir_out resolved above)
     max_step_auto: int = int(np.clip(8.0 * tau / dt, 50000, 100000))
     max_step: int = max_step_input if max_step_auto > 0 else max_step_auto
     prog_int: int = 10
@@ -462,10 +488,10 @@ def main():
     if max_step_input == 0:
         print(f'Using automatic max_step = {max_step_auto:06d}.')
 
-    # Create solv_opt object
+    # Create solv_opt object (pressure is a stored label only, never read by the solve)
     solv_opt: SolverOpt = SolverOpt(
-        pressure=pressure, voltage=voltage, k0=k0, omega=omega,
-        tol=tol, tau=tau, dt=dt, max_step=max_step, prog_int=prog_int, 
+        pressure=pressure if pressure is not None else 0, voltage=voltage, k0=k0, omega=omega,
+        tol=tol, tau=tau, dt=dt, max_step=max_step, prog_int=prog_int,
         save_int=save_int, dir_out=dir_out, soc_init=soc_init,
         restart=restart, restart_step=restart_step)
     
