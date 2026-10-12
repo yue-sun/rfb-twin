@@ -272,7 +272,7 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
         print(f'Running up to {max_step} time steps...')
         print(f'Tolerance for convergence: {tol:0.3e}')
         print(f'Flow rate at outlet: {Q_out:0.6e} cm^3/sec')
-        print(f'Maximum current of 20 mM AQDS at 100% utilization: {I_max_mA:0.6e} mA')
+        print(f'Maximum current of {c0*1e3:0.4g} mM AQDS at 100% utilization: {I_max_mA:0.6e} mA')
         print('Time steps:')
         print('step : change    :  eta      : s_wire    :  s_fluid   :  s_outlet  : util_wire : util_out')
         # Write header row to convergence file if this is the first step (skip this on a restart)
