@@ -45,7 +45,7 @@
 
 # Python cache
 *.pyc
-*/__pycache__/
+__pycache__/
 
 # Simulation outputs
 **/chk?????
