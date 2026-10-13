@@ -15,6 +15,7 @@ import time
 import datetime
 import socket
 from typing import Optional
+from numba import njit, prange
 
 # Local imports
 from utils import Geometry, FlowSim, make_P_str, make_V_str, load_flow_sim_impl
@@ -30,6 +31,17 @@ NumpyInt32Array = npt.NDArray[np.int32]
 # *************************************************************************************************
 # Physical constants
 from constants import R, T, F, V_T, ne, c0, diff, k0
+
+# *************************************************************************************************
+@njit(parallel=True, cache=True)
+def csr_matvec_clip(indptr, indices, data, x, out):
+    """out = clip(T @ x, 0, 1) for CSR T. Rows run in parallel (NUMBA_NUM_THREADS); each row is
+    summed in the same order as scipy's csr matvec, so results match the serial T.dot."""
+    for i in prange(out.shape[0]):
+        acc = 0.0
+        for k in range(indptr[i], indptr[i + 1]):
+            acc += data[k] * x[indices[k]]
+        out[i] = min(max(acc, 0.0), 1.0)
 
 # *************************************************************************************************
 # Default base directory for one simulation. The flow-sim inputs live in
@@ -111,6 +123,8 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
         soc_last: The steady state SOC field; shape (nx, ny, nz)
         overpot: The overpotential field; shape (nx, ny, nz) in millivolts, 0 on wire
     """
+    # csr_matvec_clip reads the CSR arrays directly
+    T = T.tocsr()
     # Unpack the solver options
     voltage: float = solv_opt.voltage
     k0: float = solv_opt.k0
@@ -286,17 +300,15 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
         i: int = step
         # Take time steps
         for i in range(step+1, max_step+1):
-            if (i % 2) == 1:            
-                s1[:] = T.dot(s0)
-                np.clip(s1, 0.0, 1.0, out=s1)
+            if (i % 2) == 1:
+                csr_matvec_clip(T.indptr, T.indices, T.data, s0, s1)
                 ds = s0[is_wire] - s1[is_wire]
                 np.maximum(np.sqrt(s0[is_wire] * (1.0 - s0[is_wire])), gms_min, out=gms)
                 np.arcsinh((alpha * ds) / gms, out=half_eta_new)
                 eta1[:] = omega_comp * eta0 + omega * (half_eta_new * 2.0)
                 s1[is_wire] = soc_eq(eta1)
             else:
-                s0[:] = T.dot(s1)
-                np.clip(s0, 0.0, 1.0, out=s0)
+                csr_matvec_clip(T.indptr, T.indices, T.data, s1, s0)
                 ds = s1[is_wire] - s0[is_wire]
                 np.maximum(np.sqrt(s0[is_wire] * (1.0 - s0[is_wire])), gms_min, out=gms)
                 np.arcsinh((alpha * ds) / gms, out=half_eta_new)
