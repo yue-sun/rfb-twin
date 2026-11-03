@@ -423,7 +423,13 @@ def main():
                              'kept only to reproduce earlier runs.')
     parser.add_argument('--no-project', action='store_true',
                         help='fv only: skip the divergence-free projection of the face fluxes (testing only)')
+    parser.add_argument('--periodic-y', action='store_true',
+                        help='fv only: treat the two y faces as one periodic face instead of no-flux walls. '
+                             'Use only with a flow solve that was periodic in y.')
     pa = parser.parse_args()
+    if pa.periodic_y and pa.ops != 'fv':
+        raise SystemExit('--periodic-y needs the finite-volume operator (--ops fv); the legacy operator '
+                         'has no periodic option.')
 
     # Set parameters to choose the flow simulation and set the applied voltage
     pressure: int = pa.pressure
@@ -450,13 +456,21 @@ def main():
     # Record which transport operator writes this output directory, and refuse to resume a run
     # with the other one. Directories written before 2026-11-03 have no record; they used legacy.
     path_ops: Path = dir_out / 'ops.txt'
+    # Same for the y boundary: directories with no record used walls (no periodic option existed)
+    path_periodic: Path = dir_out / 'periodic_y.txt'
+    periodic_now: str = 'true' if pa.periodic_y else 'false'
     if restart or restart_step > 0:
         ops_prev: str = path_ops.read_text().strip() if path_ops.exists() else 'legacy'
         if ops_prev != pa.ops:
             raise SystemExit(f'{dir_out} was written with --ops {ops_prev}. Resume it with '
                              f'--ops {ops_prev}, or start the --ops {pa.ops} run in a new --out-dir.')
+        periodic_prev: str = path_periodic.read_text().strip() if path_periodic.exists() else 'false'
+        if periodic_prev != periodic_now:
+            raise SystemExit(f'{dir_out} was written with periodic_y = {periodic_prev}. Resume it with the '
+                             f'same setting, or start the new run in a new --out-dir.')
     dir_out.mkdir(parents=True, exist_ok=True)
     path_ops.write_text(f'{pa.ops}\n')
+    path_periodic.write_text(f'{periodic_now}\n')
 
     # Load the flow simulation from the resolved .npy directory
     sim: FlowSim = load_flow_sim_impl(dir_npy=flow_dir, level=level)
@@ -496,6 +510,7 @@ def main():
     print(f'tol             = {tol:0.3e}')
     print(f'soc_init        = {soc_init:0.6f}')
     print(f'ops             = {pa.ops}{" (no projection)" if pa.no_project and pa.ops == "fv" else ""}')
+    print(f'periodic_y      = {pa.periodic_y}')
     # Summarize the geometry
     geom.summarize()
 
@@ -508,7 +523,8 @@ def main():
     if pa.ops == 'fv':
         # Conservative finite-volume operator (flow_op.make_transport_rate_op). The time step is
         # cfl times the operator's own explicit stability limit; wire rows are built in.
-        flux = make_face_flux(velocity=velocity, geom=geom, project=not pa.no_project, verbose=1)
+        flux = make_face_flux(velocity=velocity, geom=geom, project=not pa.no_project, verbose=1,
+                              periodic_y=pa.periodic_y)
         L: csr_array = make_transport_rate_op(flux=flux, geom=geom, diff=diff)
         dt = calc_dt_op(L, geom, cfl)
         T = csr_array(I + dt * L)
@@ -576,7 +592,8 @@ def main():
         print(f'carried out through outlet   : {bud["outlet"]:0.6e}')
         print(f'lost back into inlet plane   : {bud["inlet"]:0.6e}')
         print(f'not yet in balance           : {bud["storage"]:0.6e} ({100.0*bud["storage"]/ref:0.3f}% of release)')
-        summary: dict = dict(ops=pa.ops, voltage_mV=voltage, soc_feed=soc_init, dt_s=dt, cfl=cfl,
+        summary: dict = dict(ops=pa.ops, periodic_y=pa.periodic_y, voltage_mV=voltage, soc_feed=soc_init,
+                             dt_s=dt, cfl=cfl,
                              Q_out_uL_min=float(np.sum(flux.q[0][-1])) * 6.0E4,
                              budget_mA=bud, face_flux=flux.info)
         with open(dir_out / 'transport_budget.json', 'w') as fh_json:

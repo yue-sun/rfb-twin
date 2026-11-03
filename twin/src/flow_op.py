@@ -575,7 +575,7 @@ def summarize_op(Op: csr_array, geom: Geometry, name: str):
 #
 # The functions below build the transport operator from fluxes through cell faces instead:
 #   * the true spacing (hx, hy, hz) on every axis;
-#   * no flux through the y and z channel walls;
+#   * no flux through the y and z channel walls, or, with periodic_y, one periodic y face;
 #   * diffusion only (no advection) through faces between electrolyte and fiber cells;
 #   * volumetric face fluxes that are projected to be exactly divergence-free on the electrolyte
 #     cells, so the upwind scheme is conservative and also keeps a uniform SOC uniform.
@@ -598,6 +598,19 @@ def _pair_slices(ax: int) -> tuple[tuple[slice, ...], tuple[slice, ...], tuple[s
     return lo, hi, inner
 
 
+def _wrap_slices(ax: int) -> tuple[tuple[slice, ...], tuple[slice, ...], tuple[slice, ...], tuple[slice, ...]]:
+    """
+    Slices for the periodic wrap pair along ax: the low cell is the last cell (index n-1), the high
+    cell is the first (index 0), and the face between them is stored twice, at face index 0 and at
+    face index n. All four slices keep a length-1 axis so the arrays line up.
+    """
+    lo = tuple(slice(-1, None) if a == ax else slice(None) for a in range(3))
+    hi = tuple(slice(0, 1) if a == ax else slice(None) for a in range(3))
+    face_first = tuple(slice(0, 1) if a == ax else slice(None) for a in range(3))
+    face_last = tuple(slice(-1, None) if a == ax else slice(None) for a in range(3))
+    return lo, hi, face_first, face_last
+
+
 @dataclass
 class FaceFlux:
     """Volumetric flux through every cell face, in cm^3/s, positive along +x, +y and +z.
@@ -605,9 +618,14 @@ class FaceFlux:
     q[0] has shape (nx+1, ny, nz): q[0][i] is the face between cells i-1 and i, q[0][0] is the
     inlet boundary and q[0][nx] the outlet boundary. q[1] and q[2] are laid out the same way
     along y and z; their boundary faces are channel walls and carry no flux.
+
+    With periodic_y, the y boundary faces q[1][:, 0] and q[1][:, ny] are the same physical face,
+    between cell ny-1 and cell 0; both entries hold its flux, positive along +y, so _divergence
+    needs no special case.
     """
     q: list[NumpyFloatArray]
     info: dict
+    periodic_y: bool = False
 
 
 def _divergence(q: list[NumpyFloatArray], shape: tuple[int, int, int]) -> NumpyFloatArray:
@@ -621,15 +639,17 @@ def _divergence(q: list[NumpyFloatArray], shape: tuple[int, int, int]) -> NumpyF
 
 
 def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = True,
-                   rtol: float = 1.0E-10, verbose: int = 1) -> FaceFlux:
+                   rtol: float = 1.0E-10, verbose: int = 1, periodic_y: bool = False) -> FaceFlux:
     """
     Volumetric face fluxes for the finite-volume transport operator.
     INPUTS:
-        velocity - cell-centered velocity in cm/s; shape (nx, ny, nz, 3)
-        geom     - geometry object with cell types
-        project  - make the fluxes exactly divergence-free on the electrolyte cells (recommended)
-        rtol     - relative residual for the projection's Poisson solve
-        verbose  - print a summary when > 0
+        velocity   - cell-centered velocity in cm/s; shape (nx, ny, nz, 3)
+        geom       - geometry object with cell types
+        project    - make the fluxes exactly divergence-free on the electrolyte cells (recommended)
+        rtol       - relative residual for the projection's Poisson solve
+        verbose    - print a summary when > 0
+        periodic_y - treat the two y faces as one periodic face (the flow solve must be periodic
+                     in y too); default False keeps them as walls with no flux
     The starting flux on a face between two electrolyte cells is the face area times the average
     of the two cell velocities. Faces that touch a fiber or a channel wall carry no flux. The
     inlet and outlet boundary faces take the velocity of the adjacent electrolyte cell.
@@ -660,6 +680,12 @@ def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = Tr
         q.append(qa)
     q[0][0] = area[0] * velocity[0, :, :, 0] * fl[0]
     q[0][-1] = area[0] * velocity[-1, :, :, 0] * fl[-1]
+    # Periodic y: the face between cell ny-1 and cell 0, stored at both y boundary faces
+    w_lo, w_hi, w_first, w_last = _wrap_slices(1)
+    if periodic_y:
+        q_wrap = area[1] * 0.5 * (velocity[w_lo + (1,)] + velocity[w_hi + (1,)]) * (fl[w_lo] & fl[w_hi])
+        q[1][w_first] = q_wrap
+        q[1][w_last] = q_wrap
 
     # Electrolyte cells connected (through electrolyte faces) to the outlet plane
     idx = np.arange(N, dtype=idx_t).reshape(shape)
@@ -669,6 +695,10 @@ def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = Tr
         both = fl[lo] & fl[hi]
         e_lo.append(idx[lo][both])
         e_hi.append(idx[hi][both])
+    if periodic_y:
+        both = fl[w_lo] & fl[w_hi]
+        e_lo.append(idx[w_lo][both])
+        e_hi.append(idx[w_hi][both])
     e_lo_all = np.concatenate(e_lo)
     e_hi_all = np.concatenate(e_hi)
     adj = coo_array((np.ones(e_lo_all.size, dtype=np.int8), (e_lo_all, e_hi_all)), shape=(N, N))
@@ -683,6 +713,10 @@ def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = Tr
             lo, hi, inner = _pair_slices(ax)
             q[ax][inner] *= (is_open[lo] & is_open[hi])
         q[0][0] *= is_open[0]
+        if periodic_y:
+            open_wrap = is_open[w_lo] & is_open[w_hi]
+            q[1][w_first] *= open_wrap
+            q[1][w_last] *= open_wrap
 
     q_in_raw: float = float(np.sum(q[0][0]))
     q_out_raw: float = float(np.sum(q[0][-1]))
@@ -705,6 +739,15 @@ def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = Tr
             both = is_open[lo] & is_open[hi]
             a, b = unk[lo][both], unk[hi][both]
             beta: float = area[ax] / h[ax]
+            rows += [a, b]
+            cols += [b, a]
+            vals += [np.full(a.size, -beta), np.full(a.size, -beta)]
+            np.add.at(diag, a, beta)
+            np.add.at(diag, b, beta)
+        if periodic_y:
+            both = is_open[w_lo] & is_open[w_hi]
+            a, b = unk[w_lo][both], unk[w_hi][both]
+            beta = area[1] / h[1]
             rows += [a, b]
             cols += [b, a]
             vals += [np.full(a.size, -beta), np.full(a.size, -beta)]
@@ -749,6 +792,10 @@ def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = Tr
             lo, hi, inner = _pair_slices(ax)
             q[ax][inner] -= (area[ax] / h[ax]) * (phi3[hi] - phi3[lo]) * (is_open[lo] & is_open[hi])
         q[0][-1] += beta_b * phi3[-1] * is_open[-1]
+        if periodic_y:
+            dq_wrap = (area[1] / h[1]) * (phi3[w_hi] - phi3[w_lo]) * (is_open[w_lo] & is_open[w_hi])
+            q[1][w_first] -= dq_wrap
+            q[1][w_last] -= dq_wrap
         div_new = _divergence(q, shape)
         dq_norm: float = float(np.sqrt(sum(np.sum(np.square(qa - qb)) for qa, qb in zip(q, q_raw))))
         del q_raw
@@ -757,10 +804,16 @@ def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = Tr
                     flux_change_rel=dq_norm / max(q_raw_norm, 1e-300))
 
     info.update(Q_in=float(np.sum(q[0][0])), Q_out=float(np.sum(q[0][-1])),
-                seconds=time.time() - t0)
+                seconds=time.time() - t0, periodic_y=periodic_y)
+    if periodic_y:
+        # Net flow through the periodic y face: zero by symmetry for a fiber across the flow;
+        # nonzero means a net sideways flow around the period
+        info['Q_wrap'] = float(np.sum(q[1][w_first]))
     if verbose > 0:
         print('\nFace fluxes for the finite-volume transport operator:')
         print(f'spacing (hx, hy, hz) = ({h[0]*1e4:.4f}, {h[1]*1e4:.4f}, {h[2]*1e4:.4f}) um')
+        if periodic_y:
+            print(f'periodic in y: net flow through the periodic face = {info["Q_wrap"]*6e4:.6e} uL/min')
         print(f'enclosed electrolyte cells with no through-flow: {n_closed:d}')
         print(f'starting fluxes: Q_in = {q_in_raw*6e4:.6e} uL/min, Q_out = {q_out_raw*6e4:.6e} uL/min, '
               f'sum|div|/Q_in = {div_raw_rel:.3e}')
@@ -770,7 +823,7 @@ def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = Tr
                   f'Q_out = {info["Q_out"]*6e4:.6e} uL/min, sum|div|/Q_in = {info["div_rel"]:.3e}, '
                   f'relative flux change {info["flux_change_rel"]:.3e}')
         print(f'face fluxes built in {info["seconds"]:.1f} s')
-    return FaceFlux(q=q, info=info)
+    return FaceFlux(q=q, info=info, periodic_y=periodic_y)
 
 
 def make_transport_rate_op(flux: FaceFlux, geom: Geometry, diff: float) -> csr_array:
@@ -786,6 +839,8 @@ def make_transport_rate_op(flux: FaceFlux, geom: Geometry, diff: float) -> csr_a
     electrolyte receives; nernst.py's rate law then sets the overpotential that resupplies it.
     Advection is upwind and conservative; the outlet face carries the outlet cell's own SOC
     (zero-gradient outflow). Diffusion has no flux through the y/z walls or the outlet face.
+    If flux.periodic_y, the two y faces are one periodic face instead of walls: the last and first
+    y cells exchange through it exactly as neighboring interior cells do.
     """
     shape: tuple[int, int, int] = geom.shape
     N: int = geom.N
@@ -806,10 +861,8 @@ def make_transport_rate_op(flux: FaceFlux, geom: Geometry, diff: float) -> csr_a
         cols.append(c)
         vals.append(np.broadcast_to(v, r.shape).astype(np.float64))
 
-    for ax in range(3):
-        lo, hi, inner = _pair_slices(ax)
-        G: float = diff * area[ax] / h[ax]          # diffusive conductance, cm^3/s
-        qf: NumpyFloatArray = flux.q[ax][inner]
+    def add_pair(lo, hi, qf, G) -> None:
+        """Entries for every face between a low cell (slice lo) and a high cell (slice hi)."""
         qp = np.maximum(qf, 0.0)                    # flow from the low cell to the high cell
         qm = np.maximum(-qf, 0.0)                   # flow from the high cell to the low cell
         i_lo, i_hi = idx[lo], idx[hi]
@@ -827,6 +880,14 @@ def make_transport_rate_op(flux: FaceFlux, geom: Geometry, diff: float) -> csr_a
         add(i_lo[fw], i_hi[fw], G)
         add(i_hi[fw], i_hi[fw], -G)
         add(i_hi[fw], i_lo[fw], G)
+
+    for ax in range(3):
+        lo, hi, inner = _pair_slices(ax)
+        G: float = diff * area[ax] / h[ax]          # diffusive conductance, cm^3/s
+        add_pair(lo, hi, flux.q[ax][inner], G)
+    if flux.periodic_y:
+        w_lo, w_hi, w_first, _ = _wrap_slices(1)
+        add_pair(w_lo, w_hi, flux.q[1][w_first], diff * area[1] / h[1])
 
     # Outlet boundary faces: each outlet cell carries its own SOC out
     m = live[-1]
@@ -881,8 +942,10 @@ def transport_budget(soc: NumpyFloatArray, flux: FaceFlux, geom: Geometry, diff:
     fl, wi = geom.is_fluid, geom.is_wire
     live = fl & ~geom.is_inlet
     fiber = 0.0
-    for ax in range(3):
-        lo, hi, _ = _pair_slices(ax)
+    pairs = [(_pair_slices(ax)[:2], ax) for ax in range(3)]
+    if flux.periodic_y:
+        pairs.append((_wrap_slices(1)[:2], 1))
+    for (lo, hi), ax in pairs:
         G = diff * area[ax] / h[ax]
         m = live[lo] & wi[hi]
         fiber += G * float(np.sum(s[hi][m] - s[lo][m]))
