@@ -4,9 +4,14 @@
 # 2024-10-16
 # *************************************************************************************************
 
+import time
+from dataclasses import dataclass
+
 import numpy as np
 import numpy.typing as npt
-from scipy.sparse import coo_array, csr_array, identity
+from scipy.sparse import coo_array, csr_array, diags, identity
+from scipy.sparse.csgraph import connected_components
+from scipy.sparse.linalg import cg
 
 # Local imports
 from utils import Geometry
@@ -554,3 +559,340 @@ def summarize_op(Op: csr_array, geom: Geometry, name: str):
     print(f'pct 01  : {r_pct_01:9.2e} : {a_pct_01:9.2e} : {b_pct_01:9.2e}')
     print(f'pct 99  : {r_pct_99:9.2e} : {a_pct_99:9.2e} : {b_pct_99:9.2e}')
 
+
+# *************************************************************************************************
+# Conservative finite-volume transport (added 2026-11-03)
+#
+# The legacy operators above do not conserve the charged species:
+#   1. make_diffusion_op drops the one-sided stencil at every domain edge: its four writes share
+#      one slice and nnz is never advanced, so the next slice overwrites them. A cell on a y or z
+#      wall therefore has no diffusion along that axis, while its neighbor still exchanges with
+#      it. Charged species that diffuse toward a wall disappear.
+#   2. make_advection_op uses the upwind form u . grad(s) with the cell-centered velocity. That
+#      velocity is not divergence-free on the grid, so the form creates or destroys charged
+#      species wherever the SOC varies.
+#   3. Both use one spacing h = dx for all three axes, but the grids are anisotropic.
+#
+# The functions below build the transport operator from fluxes through cell faces instead:
+#   * the true spacing (hx, hy, hz) on every axis;
+#   * no flux through the y and z channel walls;
+#   * diffusion only (no advection) through faces between electrolyte and fiber cells;
+#   * volumetric face fluxes that are projected to be exactly divergence-free on the electrolyte
+#     cells, so the upwind scheme is conservative and also keeps a uniform SOC uniform.
+# What one cell loses through a face, its neighbor gains, so at steady state the charged species
+# released by the fibers equals the amount carried out through the outlet plus the amount that
+# diffuses back into the inlet plane (see transport_budget).
+# *************************************************************************************************
+
+def grid_spacing(geom: Geometry) -> NumpyFloatArray:
+    """Cell size (hx, hy, hz) in cm, from the domain extent and the grid shape."""
+    return (np.asarray(geom.hi, dtype=np.float64) - np.asarray(geom.lo, dtype=np.float64)) \
+        / np.array(geom.shape, dtype=np.float64)
+
+
+def _pair_slices(ax: int) -> tuple[tuple[slice, ...], tuple[slice, ...], tuple[slice, ...]]:
+    """Slices for the low cell, the high cell and the interior faces of each cell pair along ax."""
+    lo = tuple(slice(0, -1) if a == ax else slice(None) for a in range(3))
+    hi = tuple(slice(1, None) if a == ax else slice(None) for a in range(3))
+    inner = tuple(slice(1, -1) if a == ax else slice(None) for a in range(3))
+    return lo, hi, inner
+
+
+@dataclass
+class FaceFlux:
+    """Volumetric flux through every cell face, in cm^3/s, positive along +x, +y and +z.
+
+    q[0] has shape (nx+1, ny, nz): q[0][i] is the face between cells i-1 and i, q[0][0] is the
+    inlet boundary and q[0][nx] the outlet boundary. q[1] and q[2] are laid out the same way
+    along y and z; their boundary faces are channel walls and carry no flux.
+    """
+    q: list[NumpyFloatArray]
+    info: dict
+
+
+def _divergence(q: list[NumpyFloatArray], shape: tuple[int, int, int]) -> NumpyFloatArray:
+    """Net volumetric outflow of each cell, cm^3/s."""
+    div = np.zeros(shape, dtype=np.float64)
+    for ax in range(3):
+        lo = tuple(slice(0, -1) if a == ax else slice(None) for a in range(3))
+        hi = tuple(slice(1, None) if a == ax else slice(None) for a in range(3))
+        div += q[ax][hi] - q[ax][lo]
+    return div
+
+
+def make_face_flux(velocity: NumpyFloatArray, geom: Geometry, project: bool = True,
+                   rtol: float = 1.0E-10, verbose: int = 1) -> FaceFlux:
+    """
+    Volumetric face fluxes for the finite-volume transport operator.
+    INPUTS:
+        velocity - cell-centered velocity in cm/s; shape (nx, ny, nz, 3)
+        geom     - geometry object with cell types
+        project  - make the fluxes exactly divergence-free on the electrolyte cells (recommended)
+        rtol     - relative residual for the projection's Poisson solve
+        verbose  - print a summary when > 0
+    The starting flux on a face between two electrolyte cells is the face area times the average
+    of the two cell velocities. Faces that touch a fiber or a channel wall carry no flux. The
+    inlet and outlet boundary faces take the velocity of the adjacent electrolyte cell.
+
+    The projection is the discrete analog of incflo's MAC projection: it finds the
+    divergence-free flux closest to the starting flux by solving a Poisson equation for a
+    potential phi on the electrolyte cells, with phi = 0 at the outlet plane and no flux through
+    walls and fiber faces. The inlet fluxes are kept as they are, so the total flow rate is exactly
+    incflo's (the same number utils.params reports); fixing phi at the inlet as well would let
+    the projection change the flow rate by a few percent. Electrolyte with no path to the outlet
+    cannot carry a net flow, so its face fluxes (including any inlet faces) are set to zero.
+    """
+    shape: tuple[int, int, int] = geom.shape
+    N: int = geom.N
+    h: NumpyFloatArray = grid_spacing(geom)
+    vol: float = float(np.prod(h))
+    area: NumpyFloatArray = vol / h
+    fl: NumpyBoolArray = geom.is_fluid
+    t0: float = time.time()
+    idx_t = np.int32 if N < 2**31 else np.int64
+
+    # Starting fluxes: interior faces between two electrolyte cells, plus the inlet/outlet faces
+    q: list[NumpyFloatArray] = []
+    for ax in range(3):
+        lo, hi, inner = _pair_slices(ax)
+        qa = np.zeros(tuple(n + (1 if a == ax else 0) for a, n in enumerate(shape)))
+        qa[inner] = area[ax] * 0.5 * (velocity[lo + (ax,)] + velocity[hi + (ax,)]) * (fl[lo] & fl[hi])
+        q.append(qa)
+    q[0][0] = area[0] * velocity[0, :, :, 0] * fl[0]
+    q[0][-1] = area[0] * velocity[-1, :, :, 0] * fl[-1]
+
+    # Electrolyte cells connected (through electrolyte faces) to the outlet plane
+    idx = np.arange(N, dtype=idx_t).reshape(shape)
+    e_lo, e_hi = [], []
+    for ax in range(3):
+        lo, hi, _ = _pair_slices(ax)
+        both = fl[lo] & fl[hi]
+        e_lo.append(idx[lo][both])
+        e_hi.append(idx[hi][both])
+    e_lo_all = np.concatenate(e_lo)
+    e_hi_all = np.concatenate(e_hi)
+    adj = coo_array((np.ones(e_lo_all.size, dtype=np.int8), (e_lo_all, e_hi_all)), shape=(N, N))
+    _, label = connected_components(adj.tocsr(), directed=False)
+    label = label.reshape(shape)
+    del adj, e_lo_all, e_hi_all
+    is_open: NumpyBoolArray = fl & np.isin(label, np.unique(label[-1][fl[-1]]))
+    del label
+    n_closed: int = int(np.sum(fl & ~is_open))
+    if n_closed > 0:
+        for ax in range(3):
+            lo, hi, inner = _pair_slices(ax)
+            q[ax][inner] *= (is_open[lo] & is_open[hi])
+        q[0][0] *= is_open[0]
+
+    q_in_raw: float = float(np.sum(q[0][0]))
+    q_out_raw: float = float(np.sum(q[0][-1]))
+    div_raw: NumpyFloatArray = _divergence(q, shape)
+    div_raw_rel: float = float(np.sum(np.abs(div_raw[is_open]))) / max(abs(q_in_raw), 1e-300)
+    q_raw_norm: float = float(np.sqrt(sum(np.sum(qa * qa) for qa in q)))
+    info: dict = dict(Q_in_raw=q_in_raw, Q_out_raw=q_out_raw, div_raw_rel=div_raw_rel,
+                      n_closed_cells=n_closed, projected=project)
+
+    if project:
+        q_raw: list[NumpyFloatArray] = [qa.copy() for qa in q]
+        # Unknown phi on every open electrolyte cell
+        n_open: int = int(np.sum(is_open))
+        unk = np.full(shape, -1, dtype=idx_t)
+        unk[is_open] = np.arange(n_open, dtype=idx_t)
+        rows, cols, vals = [], [], []
+        diag = np.zeros(n_open, dtype=np.float64)
+        for ax in range(3):
+            lo, hi, _ = _pair_slices(ax)
+            both = is_open[lo] & is_open[hi]
+            a, b = unk[lo][both], unk[hi][both]
+            beta: float = area[ax] / h[ax]
+            rows += [a, b]
+            cols += [b, a]
+            vals += [np.full(a.size, -beta), np.full(a.size, -beta)]
+            np.add.at(diag, a, beta)
+            np.add.at(diag, b, beta)
+        # Dirichlet phi = 0 on the outlet boundary faces, half a cell from the cell center
+        beta_b: float = area[0] / (0.5 * h[0])
+        np.add.at(diag, unk[-1][is_open[-1]], beta_b)
+        rows.append(np.arange(n_open, dtype=idx_t))
+        cols.append(np.arange(n_open, dtype=idx_t))
+        vals.append(diag)
+        P = coo_array((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                      shape=(n_open, n_open)).tocsr()
+        del rows, cols, vals
+        rhs: NumpyFloatArray = -div_raw[is_open]
+        # Scale so the solve works with O(1) numbers
+        scale: float = float(np.max(np.abs(rhs))) if np.any(rhs) else 1.0
+        rhs = rhs / scale
+        solver: str
+        n_iter: int
+        try:
+            import pyamg
+            ml = pyamg.smoothed_aggregation_solver(P, symmetry='symmetric')
+            res: list = []
+            phi = ml.solve(rhs, tol=rtol, accel='cg', maxiter=1000, residuals=res)
+            solver, n_iter = 'pyamg', len(res) - 1
+        except ImportError:
+            count = [0]
+            def _cb(_):
+                count[0] += 1
+            phi, _ = cg(P, rhs, rtol=rtol, maxiter=100000, M=diags(1.0 / P.diagonal()), callback=_cb)
+            solver, n_iter = 'cg-jacobi', count[0]
+        phi_rel_res: float = float(np.linalg.norm(P @ phi - rhs) / np.linalg.norm(rhs))
+        if phi_rel_res > 1.0E-6:
+            print(f'WARNING: projection Poisson solve stopped at relative residual {phi_rel_res:.1e}; '
+                  'the face fluxes are not divergence-free and the budget will not close.')
+        phi3 = np.zeros(shape, dtype=np.float64)
+        phi3[is_open] = phi * scale
+        del P, phi
+        # Correct the fluxes: q = q* - beta * (phi_hi - phi_lo) on faces between open cells
+        for ax in range(3):
+            lo, hi, inner = _pair_slices(ax)
+            q[ax][inner] -= (area[ax] / h[ax]) * (phi3[hi] - phi3[lo]) * (is_open[lo] & is_open[hi])
+        q[0][-1] += beta_b * phi3[-1] * is_open[-1]
+        div_new = _divergence(q, shape)
+        dq_norm: float = float(np.sqrt(sum(np.sum(np.square(qa - qb)) for qa, qb in zip(q, q_raw))))
+        del q_raw
+        info.update(solver=solver, iterations=n_iter, poisson_rel_residual=phi_rel_res,
+                    div_rel=float(np.sum(np.abs(div_new[is_open]))) / max(abs(float(np.sum(q[0][0]))), 1e-300),
+                    flux_change_rel=dq_norm / max(q_raw_norm, 1e-300))
+
+    info.update(Q_in=float(np.sum(q[0][0])), Q_out=float(np.sum(q[0][-1])),
+                seconds=time.time() - t0)
+    if verbose > 0:
+        print('\nFace fluxes for the finite-volume transport operator:')
+        print(f'spacing (hx, hy, hz) = ({h[0]*1e4:.4f}, {h[1]*1e4:.4f}, {h[2]*1e4:.4f}) um')
+        print(f'enclosed electrolyte cells with no through-flow: {n_closed:d}')
+        print(f'starting fluxes: Q_in = {q_in_raw*6e4:.6e} uL/min, Q_out = {q_out_raw*6e4:.6e} uL/min, '
+              f'sum|div|/Q_in = {div_raw_rel:.3e}')
+        if project:
+            print(f'projected ({info["solver"]}, {info["iterations"]} iterations, Poisson residual '
+                  f'{info["poisson_rel_residual"]:.1e}): Q_in = {info["Q_in"]*6e4:.6e} uL/min, '
+                  f'Q_out = {info["Q_out"]*6e4:.6e} uL/min, sum|div|/Q_in = {info["div_rel"]:.3e}, '
+                  f'relative flux change {info["flux_change_rel"]:.3e}')
+        print(f'face fluxes built in {info["seconds"]:.1f} s')
+    return FaceFlux(q=q, info=info)
+
+
+def make_transport_rate_op(flux: FaceFlux, geom: Geometry, diff: float) -> csr_array:
+    """
+    Finite-volume advection-diffusion operator L in 1/s: d(SOC)/dt = L @ SOC.
+    INPUTS:
+        flux - face fluxes from make_face_flux
+        geom - geometry object with cell types and the per-cell volume of wire cells
+        diff - diffusion coefficient in cm^2/s
+    Rows exist for live electrolyte cells (not the inlet plane, which holds the feed SOC) and for
+    wire cells that share a face with a live electrolyte cell. A wire row is that cell's loss to
+    the electrolyte divided by its own volume, so what a fiber releases is exactly what the
+    electrolyte receives; nernst.py's rate law then sets the overpotential that resupplies it.
+    Advection is upwind and conservative; the outlet face carries the outlet cell's own SOC
+    (zero-gradient outflow). Diffusion has no flux through the y/z walls or the outlet face.
+    """
+    shape: tuple[int, int, int] = geom.shape
+    N: int = geom.N
+    h: NumpyFloatArray = grid_spacing(geom)
+    vol: float = float(np.prod(h))
+    area: NumpyFloatArray = vol / h
+    fl: NumpyBoolArray = geom.is_fluid
+    wi: NumpyBoolArray = geom.is_wire
+    live: NumpyBoolArray = fl & ~geom.is_inlet
+    idx = np.arange(N, dtype=np.int32 if N < 2**31 else np.int64).reshape(shape)
+
+    rows: list[NumpyInt32Array] = []
+    cols: list[NumpyInt32Array] = []
+    vals: list[NumpyFloatArray] = []
+
+    def add(r, c, v) -> None:
+        rows.append(r)
+        cols.append(c)
+        vals.append(np.broadcast_to(v, r.shape).astype(np.float64))
+
+    for ax in range(3):
+        lo, hi, inner = _pair_slices(ax)
+        G: float = diff * area[ax] / h[ax]          # diffusive conductance, cm^3/s
+        qf: NumpyFloatArray = flux.q[ax][inner]
+        qp = np.maximum(qf, 0.0)                    # flow from the low cell to the high cell
+        qm = np.maximum(-qf, 0.0)                   # flow from the high cell to the low cell
+        i_lo, i_hi = idx[lo], idx[hi]
+        ff = fl[lo] & fl[hi]
+        # Electrolyte-electrolyte faces: upwind advection plus diffusion
+        m = ff & live[lo]
+        add(i_lo[m], i_lo[m], -(G + qp[m]))
+        add(i_lo[m], i_hi[m], G + qm[m])
+        m = ff & live[hi]
+        add(i_hi[m], i_hi[m], -(G + qm[m]))
+        add(i_hi[m], i_lo[m], G + qp[m])
+        # Electrolyte-fiber faces: diffusion only, both rows
+        fw = (live[lo] & wi[hi]) | (wi[lo] & live[hi])
+        add(i_lo[fw], i_lo[fw], -G)
+        add(i_lo[fw], i_hi[fw], G)
+        add(i_hi[fw], i_hi[fw], -G)
+        add(i_hi[fw], i_lo[fw], G)
+
+    # Outlet boundary faces: each outlet cell carries its own SOC out
+    m = live[-1]
+    add(idx[-1][m], idx[-1][m], -flux.q[0][-1][m])
+
+    K = coo_array((np.concatenate(vals), (np.concatenate(rows), np.concatenate(cols))),
+                  shape=(N, N)).tocsr()
+    del rows, cols, vals
+    K.sum_duplicates()
+    # Divide each row by the volume of its cell: true volume for electrolyte, geom.volume for wire
+    inv_vol = np.zeros(N, dtype=np.float64)
+    inv_vol[live.ravel()] = 1.0 / vol
+    w = wi.ravel()
+    wv = np.asarray(geom.volume, dtype=np.float64).ravel()
+    inv_vol[w & (wv > 0)] = 1.0 / wv[w & (wv > 0)]
+    L = csr_array(diags(inv_vol) @ K)
+    L.eliminate_zeros()
+    return L
+
+
+def calc_dt_op(L: csr_array, geom: Geometry, cfl: float) -> float:
+    """
+    Time step for explicit Euler with the operator L (1/s).
+    The update s + dt * L s is a weighted average of neighbors (so bounded and monotone) when
+    dt * |L_rr| <= 1 on every row. dt is cfl times that limit on the electrolyte rows, and no more
+    than the limit on the wire rows, so a wire cell's transport update never overshoots below zero
+    before nernst.py's rate law resets it.
+    """
+    d: NumpyFloatArray = -L.diagonal()
+    d_fluid: float = float(np.max(d[geom.is_live.ravel()]))
+    w = geom.is_wire.ravel()
+    d_wire: float = float(np.max(d[w])) if np.any(w) else 0.0
+    dt: float = cfl / d_fluid
+    if d_wire > 0.0:
+        dt = min(dt, 1.0 / d_wire)
+    return dt
+
+
+def transport_budget(soc: NumpyFloatArray, flux: FaceFlux, geom: Geometry, diff: float,
+                     feed: float) -> dict:
+    """
+    Charged-species budget of a SOC field under the finite-volume operator, in cm^3/s of SOC
+    (multiply by ne * F * c0 for mA). Charged species means SOC above the feed value.
+        fiber  : released by the fibers into the electrolyte (diffusion through fiber faces)
+        outlet : carried out through the outlet plane
+        inlet  : lost back into the inlet plane, which is held at the feed SOC
+        storage: fiber - outlet - inlet; zero at steady state
+    """
+    s = np.asarray(soc, dtype=np.float64).reshape(geom.shape)
+    h = grid_spacing(geom)
+    area = float(np.prod(h)) / h
+    fl, wi = geom.is_fluid, geom.is_wire
+    live = fl & ~geom.is_inlet
+    fiber = 0.0
+    for ax in range(3):
+        lo, hi, _ = _pair_slices(ax)
+        G = diff * area[ax] / h[ax]
+        m = live[lo] & wi[hi]
+        fiber += G * float(np.sum(s[hi][m] - s[lo][m]))
+        m = wi[lo] & live[hi]
+        fiber += G * float(np.sum(s[lo][m] - s[hi][m]))
+    outlet = float(np.sum(flux.q[0][-1] * (s[-1] - feed) * live[-1]))
+    # Face between the inlet plane (i = 0) and the first live plane (i = 1)
+    G = diff * area[0] / h[0]
+    q01 = flux.q[0][1]
+    m = fl[0] & live[1]
+    inlet = float(np.sum((G * (s[1] - s[0]) + np.maximum(-q01, 0.0) * (s[1] - feed)
+                          - np.maximum(q01, 0.0) * (s[0] - feed)) * m))
+    return dict(fiber=fiber, outlet=outlet, inlet=inlet, storage=fiber - outlet - inlet)

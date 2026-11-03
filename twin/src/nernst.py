@@ -11,6 +11,7 @@ from scipy.special import expit
 from pathlib import Path
 from dataclasses import dataclass
 import argparse
+import json
 import time
 import datetime
 import socket
@@ -20,6 +21,8 @@ from numba import njit, prange
 # Local imports
 from utils import Geometry, FlowSim, make_P_str, make_V_str, load_flow_sim_impl
 from flow_op import calc_dt, make_time_step_op, adjust_op_wire, summarize_op
+from flow_op import (FaceFlux, calc_dt_op, grid_spacing, make_face_flux, make_transport_rate_op,
+                     transport_budget)
 from mt_util import load_flow_sim
 
 # Define the types of the data
@@ -107,6 +110,9 @@ class SolverOpt:
     restart: bool = False
     # Step at start; used when restarting
     restart_step: int = 0
+    # Volumetric flow through each outlet face in cm^3/s, shape (ny, nz); from the finite-volume
+    # operator's face fluxes. When None, the outlet cell velocity times the face area hy*hz is used.
+    q_out: Optional[NumpyFloatArray] = None
 
 # *************************************************************************************************
 def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_opt: SolverOpt) \
@@ -149,8 +155,6 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
     N: int = geom.N
     # Shape of the grid
     shape: tuple[int, int, int] = (geom.nx, geom.ny, geom.nz)
-    # Grid spacing in cm
-    h: float = geom.h
 
     # Mask for cells of different types; flatten to 1d
     is_fluid: NumpyBoolArray = geom.is_fluid.flatten()
@@ -255,14 +259,16 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
     # Factor to inflate one step RMS change to make it dimensionless
     rms_mult: float = tau / dt
 
-    # Velocity x component
-    u: NumpyFloatArray = velocity[:, :, :, 0].flatten()
-    # Velocity at the outlet
-    u_out: NumpyFloatArray = u[is_outlet]
-    # Sum of velocity at the outlet; used for utilization
-    u_out_sum: float = float(np.sum(u_out))
+    # Volumetric flow through each outlet face in cm^3/s; also the weights for the flow-averaged
+    # outlet SOC. (Until 2026-11-03 this was sum(u) * h^2 with h = dx, which overstates the flow
+    # rate by dx/dz on the anisotropic grids.)
+    if solv_opt.q_out is not None:
+        q_out: NumpyFloatArray = np.asarray(solv_opt.q_out, dtype=np.float64).flatten()
+    else:
+        h_xyz: NumpyFloatArray = grid_spacing(geom)
+        q_out = velocity[:, :, :, 0].flatten()[is_outlet] * h_xyz[1] * h_xyz[2]
     # Flow rate in cubic centimeters per second
-    Q_out: float = u_out_sum * h * h
+    Q_out: float = float(np.sum(q_out))
 
     # Current at 100% utilization
     Q_Lps: float = Q_out * 1.0E-3           # Flow rate in liters per second
@@ -276,7 +282,7 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
     s_fluid: float = float(np.mean(get_last_soc(step)[is_fluid]))
     s_out: float = float(np.mean(get_last_soc(step)[is_outlet]))
     util_wire: float = 0.0
-    util_out: float = float(np.sum(get_last_soc(step)[is_outlet] * u_out) / u_out_sum) if u_out_sum != 0.0 else 0.0
+    util_out: float = float(np.sum(get_last_soc(step)[is_outlet] * q_out) / Q_out) if Q_out != 0.0 else 0.0
     current: float = I_max_mA * util_wire
 
     # Open text file to write convergence data
@@ -310,7 +316,10 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
             else:
                 csr_matvec_clip(T.indptr, T.indices, T.data, s1, s0)
                 ds = s1[is_wire] - s0[is_wire]
-                np.maximum(np.sqrt(s0[is_wire] * (1.0 - s0[is_wire])), gms_min, out=gms)
+                # gms from the SOC at the start of the step (s1), as on odd steps. Until 2026-11-03
+                # this read s0, which the matvec above has just overwritten; even and odd steps then
+                # used different surface SOCs and the solution kept a two-step oscillation.
+                np.maximum(np.sqrt(s1[is_wire] * (1.0 - s1[is_wire])), gms_min, out=gms)
                 np.arcsinh((alpha * ds) / gms, out=half_eta_new)
                 eta0[:] = omega_comp * eta1 + omega * (half_eta_new * 2.0)
                 s0[is_wire] = soc_eq(eta0)
@@ -338,7 +347,7 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
                 # Utilization on the wire; by summing source rate times volume on the cut cells
                 util_wire: float = (2.0 * k0 / Q_out) * np.sum(area * gms * np.sinh(eta_last / 2.0))
                 # Utilization at the outlet; this is the SOC weighted by the velocity at the outlet
-                util_out: float = float(np.sum(soc_last[is_outlet] * u_out) / u_out_sum)
+                util_out: float = float(np.sum(soc_last[is_outlet] * q_out) / Q_out)
                 # Current in milliamps on the wire
                 current: float = I_max_mA * util_wire
                 # DEBUG output
@@ -347,7 +356,7 @@ def solve_nernst(T: csr_array, velocity: NumpyFloatArray, geom: Geometry, solv_o
                 print(f'{i:4d} : {rms_chng:0.3e} : {eta_mean:0.6f} :  {s_wire:0.6f}  :  {s_fluid:0.6f}  :'
                       f'  {s_out:0.6f}  :  {util_wire:0.6f} :  {util_out:0.6f}', flush=True)
                 # Write to convergence file
-                fh.write(f'{i:d},{rms_chng:0.6e},{eta_mean:0.6f}{s_wire:0.12f},{s_fluid:0.12f},'
+                fh.write(f'{i:d},{rms_chng:0.6e},{eta_mean:0.6f},{s_wire:0.12f},{s_fluid:0.12f},'
                          f'{s_out:0.12f},{util_wire:0.12f},{util_out:0.12f}\n')
                 # Have we converged early?
                 if rms_chng < tol:
@@ -407,6 +416,13 @@ def main():
     parser.add_argument('-R', '--restart', action='store_true',
                         help='Whether to restart from last step (bool, default False)')
     parser.add_argument('--restart_step', type=int, default=0, help='Specific step to restart from (int, default 0)')
+    parser.add_argument('--ops', choices=['fv', 'legacy'], default='fv',
+                        help='Transport operator. fv (default since 2026-11-03): conservative '
+                             'finite-volume form on divergence-free face fluxes. legacy: the original '
+                             'operators, which lose charged species at the y/z walls and in the bulk; '
+                             'kept only to reproduce earlier runs.')
+    parser.add_argument('--no-project', action='store_true',
+                        help='fv only: skip the divergence-free projection of the face fluxes (testing only)')
     pa = parser.parse_args()
 
     # Set parameters to choose the flow simulation and set the applied voltage
@@ -431,6 +447,17 @@ def main():
     flow_dir: Path = Path(pa.flow_dir) if pa.flow_dir else base_dir / SUBDIR_FLOW
     dir_out: Path = Path(pa.out_dir) if pa.out_dir else base_dir / SUBDIR_OUT
 
+    # Record which transport operator writes this output directory, and refuse to resume a run
+    # with the other one. Directories written before 2026-11-03 have no record; they used legacy.
+    path_ops: Path = dir_out / 'ops.txt'
+    if restart or restart_step > 0:
+        ops_prev: str = path_ops.read_text().strip() if path_ops.exists() else 'legacy'
+        if ops_prev != pa.ops:
+            raise SystemExit(f'{dir_out} was written with --ops {ops_prev}. Resume it with '
+                             f'--ops {ops_prev}, or start the --ops {pa.ops} run in a new --out-dir.')
+    dir_out.mkdir(parents=True, exist_ok=True)
+    path_ops.write_text(f'{pa.ops}\n')
+
     # Load the flow simulation from the resolved .npy directory
     sim: FlowSim = load_flow_sim_impl(dir_npy=flow_dir, level=level)
 
@@ -441,8 +468,6 @@ def main():
     # Unpack grid spacing
     h: float = sim.geom.h
 
-    # Calculate the time steps
-    dt: float = calc_dt(velocity=velocity, h=h, diff=diff, cfl=cfl)
     # Mean velocity in x component at inlet
     u_bar: float = float(np.mean(velocity[0, :, :, 0]))
     # Nominal time to flow across the domain
@@ -470,19 +495,32 @@ def main():
     print(f'omega           = {omega:0.3e}')
     print(f'tol             = {tol:0.3e}')
     print(f'soc_init        = {soc_init:0.6f}')
+    print(f'ops             = {pa.ops}{" (no projection)" if pa.no_project and pa.ops == "fv" else ""}')
     # Summarize the geometry
     geom.summarize()
 
     # Build the time step operator
     print('Building time step operator...')
-    verbose: int = 0
-    T: csr_array = make_time_step_op(velocity=velocity, geom=geom, diff=diff, dt=dt, verbose=verbose)
-    # Add offsetting entries to wire cells
-    T = adjust_op_wire(T, geom)
-    # Report summary 
     I: csr_array = csr_array(identity(geom.N))
-    F: csr_array = T - I
-    summarize_op(F, geom, 'Flow operator with wire entries')
+    flux: Optional[FaceFlux] = None
+    dt: float
+    T: csr_array
+    if pa.ops == 'fv':
+        # Conservative finite-volume operator (flow_op.make_transport_rate_op). The time step is
+        # cfl times the operator's own explicit stability limit; wire rows are built in.
+        flux = make_face_flux(velocity=velocity, geom=geom, project=not pa.no_project, verbose=1)
+        L: csr_array = make_transport_rate_op(flux=flux, geom=geom, diff=diff)
+        dt = calc_dt_op(L, geom, cfl)
+        T = csr_array(I + dt * L)
+        del L
+    else:
+        dt = calc_dt(velocity=velocity, h=h, diff=diff, cfl=cfl)
+        verbose: int = 0
+        T = make_time_step_op(velocity=velocity, geom=geom, diff=diff, dt=dt, verbose=verbose)
+        # Add offsetting entries to wire cells
+        T = adjust_op_wire(T, geom)
+    # Report summary
+    summarize_op(T - I, geom, 'Flow operator with wire entries')
 
     # Additional options for the steady state solver (dir_out resolved above)
     max_step_auto: int = int(np.clip(8.0 * tau / dt, 50000, 100000))
@@ -505,10 +543,11 @@ def main():
         pressure=pressure if pressure is not None else 0, voltage=voltage, k0=k0, omega=omega,
         tol=tol, tau=tau, dt=dt, max_step=max_step, prog_int=prog_int,
         save_int=save_int, dir_out=dir_out, soc_init=soc_init,
-        restart=restart, restart_step=restart_step)
-    
+        restart=restart, restart_step=restart_step,
+        q_out=None if flux is None else flux.q[0][-1])
+
     # Solve for steady state
-    soc: NumpyFloatArray 
+    soc: NumpyFloatArray
     overpot: NumpyFloatArray
     soc, overpot = solve_nernst(T=T, velocity=velocity, geom=geom, solv_opt=solv_opt)
 
@@ -517,6 +556,31 @@ def main():
     path_op: Path = dir_out / 'overpot_steady.npy'
     np.save(path_soc, soc)
     np.save(path_op, overpot)
+
+    # Charged-species budget (finite-volume operator only): at steady state the charged species the
+    # fibers release equals the rate-law current, and leaves through the outlet or the inlet plane
+    if flux is not None:
+        to_mA: float = ne * F * c0          # (cm^3/s of SOC) -> mA, c0 in mol/L
+        bud: dict = {k: v * to_mA for k, v in
+                     transport_budget(soc=soc, flux=flux, geom=geom, diff=diff, feed=soc_init).items()}
+        is_wire: NumpyBoolArray = geom.is_wire.flatten()
+        s_w: NumpyFloatArray = soc.flatten()[is_wire]
+        eta_w: NumpyFloatArray = overpot.flatten()[is_wire] * (ne / V_T)
+        gms_w: NumpyFloatArray = np.maximum(np.sqrt(s_w * (1.0 - s_w)), 1.0E-3)
+        bud['rate_law'] = float(to_mA * 2.0 * k0 * np.sum(geom.area.flatten()[is_wire] * gms_w
+                                                         * np.sinh(eta_w / 2.0)))
+        ref: float = abs(bud['fiber']) if bud['fiber'] != 0.0 else 1.0
+        print('\nCharged-species budget in mA (SOC above the feed):')
+        print(f'released by the fibers       : {bud["fiber"]:0.6e}')
+        print(f'rate-law current on the wire : {bud["rate_law"]:0.6e}')
+        print(f'carried out through outlet   : {bud["outlet"]:0.6e}')
+        print(f'lost back into inlet plane   : {bud["inlet"]:0.6e}')
+        print(f'not yet in balance           : {bud["storage"]:0.6e} ({100.0*bud["storage"]/ref:0.3f}% of release)')
+        summary: dict = dict(ops=pa.ops, voltage_mV=voltage, soc_feed=soc_init, dt_s=dt, cfl=cfl,
+                             Q_out_uL_min=float(np.sum(flux.q[0][-1])) * 6.0E4,
+                             budget_mA=bud, face_flux=flux.info)
+        with open(dir_out / 'transport_budget.json', 'w') as fh_json:
+            json.dump(summary, fh_json, indent=2, default=float)
 
 # *************************************************************************************************
 def test():
